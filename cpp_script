@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+enable_core_dumps() {
+  if [[ -z "$1" ]]; then
+    echo 'ERROR: a core file path not provided'
+  fi
+  local core_file_path=$1
+  echo "Do you want to set/create the core file path = $core_file_path? (yes/no)"
+  read -r answer
+  if [[ "yes" == "$answer" ]]; then
+    if [[ ! -e "$core_file_path" ]]; then
+      sudo mkdir -p "$core_file_path"
+      sudo chmod a+w "$core_file_path"
+    fi
+  else
+    return 0
+  fi
+  ulimit -c unlimited
+  ulimit -c
+  sudo sed -i '/kernel.core*/d' /etc/sysctl.conf
+  sudo bash -c "echo -e 'kernel.core_pattern = $core_file_path/core-%e-%p-%t\nkernel.core_uses_pid = 0' >> /etc/sysctl.conf"
+  sudo sysctl -p
+}
