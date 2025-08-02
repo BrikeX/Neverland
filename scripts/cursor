@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+cursor() {
+  (nohup ~/Cursor.AppImage "$@" >/dev/null 2>&1 &)
+}
