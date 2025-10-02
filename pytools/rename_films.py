@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os
 import argparse
+import os
 
 # https://sylikc.github.io/pyexiftool/installation.html
 import exiftool
-
 
 parser = argparse.ArgumentParser(
     description="Process films in a directory and rename them by their date and time"
