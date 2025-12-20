@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+# Default: do not keep original directories
+KEEP_DIRS=false
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -k|--keep)
+            KEEP_DIRS=true
+            shift
+            ;;
+        *)
+            TARGET_DIR="$1"
+            shift
+            ;;
+    esac
+done
+
+# Check if directory argument is provided
+if [ -z "$TARGET_DIR" ]; then
+    echo "Usage: $0 [-k|--keep] <directory>"
+    echo "  -k, --keep    Keep original directories after archiving (default: false)"
+    exit 1
+fi
+
+# Check if target directory exists
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "Error: Directory '$TARGET_DIR' does not exist"
+    exit 1
+fi
+
+# Change to the target directory
+cd "$TARGET_DIR" || exit 1
+
+# Find all directories (excluding hidden ones) and tar them
+for dir in */; do
+    # Remove trailing slash
+    dir_name="${dir%/}"
+    
+    # Skip if it's not a directory
+    [ -d "$dir_name" ] || continue
+    
+    echo "Archiving $dir_name..."
+    tar -czvf "${dir_name}.tar.gz" "$dir_name"
+    
+    # Remove original directory if KEEP_DIRS is false
+    if [ "$KEEP_DIRS" = false ]; then
+        echo "Removing $dir_name..."
+        rm -rf "$dir_name"
+    fi
+done
+
+echo "Done!"
