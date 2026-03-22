@@ -3,11 +3,18 @@
 # Default: do not keep original directories
 KEEP_DIRS=false
 
+# Default: no compression
+COMPRESS=false
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         -k|--keep)
             KEEP_DIRS=true
+            shift
+            ;;
+        -c|--compress)
+            COMPRESS=true
             shift
             ;;
         *)
@@ -19,8 +26,9 @@ done
 
 # Check if directory argument is provided
 if [ -z "$TARGET_DIR" ]; then
-    echo "Usage: $0 [-k|--keep] <directory>"
-    echo "  -k, --keep    Keep original directories after archiving (default: false)"
+    echo "Usage: $0 [-k|--keep] [-c|--compress] <directory>"
+    echo "  -k, --keep       Keep original directories after archiving (default: false)"
+    echo "  -c, --compress   Create compressed .tar.gz archives (default: uncompressed)"
     exit 1
 fi
 
@@ -41,8 +49,13 @@ for dir in */; do
     # Skip if it's not a directory
     [ -d "$dir_name" ] || continue
     
-    echo "Archiving $dir_name..."
-    tar -czvf "${dir_name}.tar.gz" "$dir_name"
+    if [ "$COMPRESS" = true ]; then
+        echo "Archiving $dir_name (compressed)..."
+        tar -czvf "${dir_name}.tar.gz" "$dir_name"
+    else
+        echo "Archiving $dir_name (uncompressed)..."
+        tar -cvf "${dir_name}.tar" "$dir_name"
+    fi
     
     # Remove original directory if KEEP_DIRS is false
     if [ "$KEEP_DIRS" = false ]; then

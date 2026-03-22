@@ -33,14 +33,23 @@ fi
 # Change to the target directory
 cd "$TARGET_DIR" || exit 1
 
-# Find all .tar.gz files and extract them
-for archive in *.tar.gz; do
-    # Skip if no .tar.gz files found
+# Find all .tar.gz, .tgz, and .tar files and extract them
+for archive in *.tar.gz *.tgz *.tar; do
+    # Skip if glob matched nothing
     [ -e "$archive" ] || continue
-    
-    echo "Extracting $archive..."
-    tar -xzvf "$archive"
-    
+
+    # Auto-detect compression by extension
+    case "$archive" in
+        *.tar.gz|*.tgz)
+            echo "Extracting $archive (compressed)..."
+            tar -xzvf "$archive"
+            ;;
+        *.tar)
+            echo "Extracting $archive (uncompressed)..."
+            tar -xvf "$archive"
+            ;;
+    esac
+
     # Remove archive if KEEP_ARCHIVES is false
     if [ "$KEEP_ARCHIVES" = false ]; then
         echo "Removing $archive..."
