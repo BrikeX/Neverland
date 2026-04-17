@@ -2,6 +2,7 @@
 Checks: >
   -*,
   bugprone-*,
+  -bugprone-easily-swappable-parameters,
   clang-analyzer-*,
   concurrency-*,
   cppcoreguidelines-*,
@@ -17,7 +18,6 @@ Checks: >
   -performance-avoid-endl,
   portability-*,
   readability-*,
-  -readability-magic-numbers,
   -readability-redundant-access-specifiers,
   -readability-avoid-const-params-in-decls
 
