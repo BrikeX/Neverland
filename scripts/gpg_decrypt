@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+KEEP_ENCRYPTED=false
+PASSPHRASE_FILE=""
+OUTPUT=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -k | --keep)
+    KEEP_ENCRYPTED=true
+    shift
+    ;;
+  -p | --passphrase-file)
+    PASSPHRASE_FILE="$2"
+    shift 2
+    ;;
+  -o | --output)
+    OUTPUT="$2"
+    shift 2
+    ;;
+  -h | --help)
+    echo "Usage: $0 [OPTIONS] <file.gpg>"
+    echo
+    echo "Decrypt a GPG-encrypted file."
+    echo
+    echo "Options:"
+    echo "  -k, --keep                Keep encrypted file after decryption (default: remove)"
+    echo "  -p, --passphrase-file F   Read passphrase from file F (default: interactive prompt)"
+    echo "  -o, --output FILE         Output file path (default: strip .gpg extension)"
+    echo "  -h, --help                Show this help"
+    echo
+    echo "Examples:"
+    echo "  $0 secret.pdf.gpg"
+    echo "  $0 -k -o decrypted.pdf secret.pdf.gpg"
+    echo "  $0 -p ~/.passphrase secret.pdf.gpg"
+    exit 0
+    ;;
+  -*)
+    echo "Error: Unknown option '$1'. Use -h for help." >&2
+    exit 1
+    ;;
+  *)
+    INPUT_FILE="$1"
+    shift
+    ;;
+  esac
+done
+
+if [ -z "${INPUT_FILE:-}" ]; then
+  echo "Error: No input file specified. Use -h for help." >&2
+  exit 1
+fi
+
+if [ ! -f "$INPUT_FILE" ]; then
+  echo "Error: File '$INPUT_FILE' does not exist." >&2
+  exit 1
+fi
+
+if ! command -v gpg &>/dev/null; then
+  echo "Error: gpg is not installed." >&2
+  exit 1
+fi
+
+if [ -z "$OUTPUT" ]; then
+  case "$INPUT_FILE" in
+  *.gpg) OUTPUT="${INPUT_FILE%.gpg}" ;;
+  *.asc) OUTPUT="${INPUT_FILE%.asc}" ;;
+  *) OUTPUT="${INPUT_FILE}.decrypted" ;;
+  esac
+fi
+
+if [ -f "$OUTPUT" ]; then
+  echo "Error: Output file '$OUTPUT' already exists. Remove it first or use -o." >&2
+  exit 1
+fi
+
+PASSPHRASE_ARGS=()
+if [ -n "$PASSPHRASE_FILE" ]; then
+  if [ ! -f "$PASSPHRASE_FILE" ]; then
+    echo "Error: Passphrase file '$PASSPHRASE_FILE' does not exist." >&2
+    exit 1
+  fi
+  PASSPHRASE_ARGS=(--batch --yes --pinentry-mode loopback --passphrase-file "$PASSPHRASE_FILE")
+fi
+
+echo "Decrypting: $INPUT_FILE -> $OUTPUT"
+
+if gpg --decrypt \
+  --no-symkey-cache \
+  "${PASSPHRASE_ARGS[@]}" \
+  --output "$OUTPUT" \
+  "$INPUT_FILE" && [ -f "$OUTPUT" ]; then
+  echo "Decrypted successfully: $OUTPUT ($(du -h "$OUTPUT" | cut -f1))"
+
+  if [ "$KEEP_ENCRYPTED" = false ]; then
+    rm -f "$INPUT_FILE"
+    echo "Encrypted file removed."
+  else
+    echo "Encrypted file kept."
+  fi
+else
+  echo "Error: Decryption failed." >&2
+  exit 1
+fi
