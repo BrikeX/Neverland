@@ -21,20 +21,21 @@ while [[ $# -gt 0 ]]; do
     shift 2
     ;;
   -h | --help)
-    echo "Usage: $0 [OPTIONS] <file.gpg>"
+    echo "Usage: $0 [OPTIONS] <file.gpg|directory>"
     echo
-    echo "Decrypt a GPG-encrypted file."
+    echo "Decrypt a GPG-encrypted file or every .gpg/.asc file in a directory."
     echo
     echo "Options:"
-    echo "  -k, --keep                Keep encrypted file after decryption (default: remove)"
+    echo "  -k, --keep                Keep encrypted file(s) after decryption (default: remove)"
     echo "  -p, --passphrase-file F   Read passphrase from file F (default: interactive prompt)"
-    echo "  -o, --output FILE         Output file path (default: strip .gpg extension)"
+    echo "  -o, --output FILE         Output file path (single file only; default: strip .gpg extension)"
     echo "  -h, --help                Show this help"
     echo
     echo "Examples:"
     echo "  $0 secret.pdf.gpg"
     echo "  $0 -k -o decrypted.pdf secret.pdf.gpg"
     echo "  $0 -p ~/.passphrase secret.pdf.gpg"
+    echo "  $0 ~/Documents/sensitive/"
     exit 0
     ;;
   -*)
@@ -42,19 +43,19 @@ while [[ $# -gt 0 ]]; do
     exit 1
     ;;
   *)
-    INPUT_FILE="$1"
+    INPUT_PATH="$1"
     shift
     ;;
   esac
 done
 
-if [ -z "${INPUT_FILE:-}" ]; then
-  echo "Error: No input file specified. Use -h for help." >&2
+if [ -z "${INPUT_PATH:-}" ]; then
+  echo "Error: No input file or directory specified. Use -h for help." >&2
   exit 1
 fi
 
-if [ ! -f "$INPUT_FILE" ]; then
-  echo "Error: File '$INPUT_FILE' does not exist." >&2
+if [ ! -e "$INPUT_PATH" ]; then
+  echo "Error: '$INPUT_PATH' does not exist." >&2
   exit 1
 fi
 
@@ -63,16 +64,8 @@ if ! command -v gpg &>/dev/null; then
   exit 1
 fi
 
-if [ -z "$OUTPUT" ]; then
-  case "$INPUT_FILE" in
-  *.gpg) OUTPUT="${INPUT_FILE%.gpg}" ;;
-  *.asc) OUTPUT="${INPUT_FILE%.asc}" ;;
-  *) OUTPUT="${INPUT_FILE}.decrypted" ;;
-  esac
-fi
-
-if [ -f "$OUTPUT" ]; then
-  echo "Error: Output file '$OUTPUT' already exists. Remove it first or use -o." >&2
+if [ -d "$INPUT_PATH" ] && [ -n "$OUTPUT" ]; then
+  echo "Error: -o/--output cannot be used with a directory." >&2
   exit 1
 fi
 
@@ -85,22 +78,60 @@ if [ -n "$PASSPHRASE_FILE" ]; then
   PASSPHRASE_ARGS=(--batch --yes --pinentry-mode loopback --passphrase-file "$PASSPHRASE_FILE")
 fi
 
-echo "Decrypting: $INPUT_FILE -> $OUTPUT"
+output_for_file() {
+  local f="$1"
+  case "$f" in
+  *.gpg) echo "${f%.gpg}" ;;
+  *.asc) echo "${f%.asc}" ;;
+  *) echo "${f}.decrypted" ;;
+  esac
+}
 
-if gpg --decrypt \
-  --no-symkey-cache \
-  "${PASSPHRASE_ARGS[@]}" \
-  --output "$OUTPUT" \
-  "$INPUT_FILE" && [ -f "$OUTPUT" ]; then
-  echo "Decrypted successfully: $OUTPUT ($(du -h "$OUTPUT" | cut -f1))"
+decrypt_file() {
+  local input="$1"
+  local output="${2:-$(output_for_file "$input")}"
 
-  if [ "$KEEP_ENCRYPTED" = false ]; then
-    rm -f "$INPUT_FILE"
-    echo "Encrypted file removed."
-  else
-    echo "Encrypted file kept."
+  if [ -f "$output" ]; then
+    echo "Skipping: Output file '$output' already exists." >&2
+    return 1
   fi
+
+  echo "Decrypting: $input -> $output"
+
+  if gpg --decrypt \
+    --no-symkey-cache \
+    "${PASSPHRASE_ARGS[@]}" \
+    --output "$output" \
+    "$input" && [ -f "$output" ]; then
+    echo "Decrypted successfully: $output ($(du -h "$output" | cut -f1))"
+
+    if [ "$KEEP_ENCRYPTED" = false ]; then
+      rm -f "$input"
+      echo "Encrypted file removed."
+    else
+      echo "Encrypted file kept."
+    fi
+  else
+    echo "Error: Decryption failed for '$input'." >&2
+    return 1
+  fi
+}
+
+FAIL_COUNT=0
+
+if [ -d "$INPUT_PATH" ]; then
+  FILE_COUNT=0
+  while IFS= read -r -d '' file; do
+    FILE_COUNT=$((FILE_COUNT + 1))
+    decrypt_file "$file" || FAIL_COUNT=$((FAIL_COUNT + 1))
+  done < <(find "$INPUT_PATH" -maxdepth 1 -type f \( -name '*.gpg' -o -name '*.asc' \) -print0 | sort -z)
+
+  if [ "$FILE_COUNT" -eq 0 ]; then
+    echo "No .gpg or .asc files found in '$INPUT_PATH'."
+    exit 0
+  fi
+  echo "Done: $((FILE_COUNT - FAIL_COUNT))/$FILE_COUNT files decrypted."
+  [ "$FAIL_COUNT" -eq 0 ] || exit 1
 else
-  echo "Error: Decryption failed." >&2
-  exit 1
+  decrypt_file "$INPUT_PATH" "$OUTPUT"
 fi
