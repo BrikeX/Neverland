@@ -8,34 +8,44 @@ COMPRESS=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        -k|--keep)
-            KEEP_DIRS=true
-            shift
-            ;;
-        -c|--compress)
-            COMPRESS=true
-            shift
-            ;;
-        *)
-            TARGET_DIR="$1"
-            shift
-            ;;
-    esac
+  case $1 in
+  -h | --help)
+    echo "Usage: $0 [-k|--keep] [-c|--compress] <directory>"
+    echo
+    echo "Archive each subdirectory under <directory> into a separate tar file."
+    echo
+    echo "Options:"
+    echo "  -k, --keep       Keep original directories after archiving (default: remove)"
+    echo "  -c, --compress   Create compressed .tar.gz archives (default: uncompressed .tar)"
+    echo "  -h, --help       Show this help message and exit"
+    exit 0
+    ;;
+  -k | --keep)
+    KEEP_DIRS=true
+    shift
+    ;;
+  -c | --compress)
+    COMPRESS=true
+    shift
+    ;;
+  *)
+    TARGET_DIR="$1"
+    shift
+    ;;
+  esac
 done
 
 # Check if directory argument is provided
 if [ -z "$TARGET_DIR" ]; then
-    echo "Usage: $0 [-k|--keep] [-c|--compress] <directory>"
-    echo "  -k, --keep       Keep original directories after archiving (default: false)"
-    echo "  -c, --compress   Create compressed .tar.gz archives (default: uncompressed)"
-    exit 1
+  echo "Error: no target directory specified" >&2
+  echo "Try '$0 --help' for more information." >&2
+  exit 1
 fi
 
 # Check if target directory exists
 if [ ! -d "$TARGET_DIR" ]; then
-    echo "Error: Directory '$TARGET_DIR' does not exist"
-    exit 1
+  echo "Error: Directory '$TARGET_DIR' does not exist" >&2
+  exit 1
 fi
 
 # Change to the target directory
@@ -43,25 +53,25 @@ cd "$TARGET_DIR" || exit 1
 
 # Find all directories (excluding hidden ones) and tar them
 for dir in */; do
-    # Remove trailing slash
-    dir_name="${dir%/}"
-    
-    # Skip if it's not a directory
-    [ -d "$dir_name" ] || continue
-    
-    if [ "$COMPRESS" = true ]; then
-        echo "Archiving $dir_name (compressed)..."
-        tar -czvf "${dir_name}.tar.gz" "$dir_name"
-    else
-        echo "Archiving $dir_name (uncompressed)..."
-        tar -cvf "${dir_name}.tar" "$dir_name"
-    fi
-    
-    # Remove original directory if KEEP_DIRS is false
-    if [ "$KEEP_DIRS" = false ]; then
-        echo "Removing $dir_name..."
-        rm -rf "$dir_name"
-    fi
+  # Remove trailing slash
+  dir_name="${dir%/}"
+
+  # Skip if it's not a directory
+  [ -d "$dir_name" ] || continue
+
+  if [ "$COMPRESS" = true ]; then
+    echo "Archiving $dir_name (compressed)..."
+    tar -czvf "${dir_name}.tar.gz" "$dir_name"
+  else
+    echo "Archiving $dir_name (uncompressed)..."
+    tar -cvf "${dir_name}.tar" "$dir_name"
+  fi
+
+  # Remove original directory if KEEP_DIRS is false
+  if [ "$KEEP_DIRS" = false ]; then
+    echo "Removing $dir_name..."
+    rm -rf "$dir_name"
+  fi
 done
 
 echo "Done!"

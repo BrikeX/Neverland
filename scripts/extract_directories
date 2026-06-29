@@ -5,29 +5,39 @@ KEEP_ARCHIVES=true
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        -d|--delete)
-            KEEP_ARCHIVES=false
-            shift
-            ;;
-        *)
-            TARGET_DIR="$1"
-            shift
-            ;;
-    esac
+  case $1 in
+  -h | --help)
+    echo "Usage: $0 [-d|--delete] <directory>"
+    echo
+    echo "Extract all .tar.gz, .tgz, and .tar archives found in <directory>."
+    echo
+    echo "Options:"
+    echo "  -d, --delete    Delete archive files after extraction (default: keep)"
+    echo "  -h, --help      Show this help message and exit"
+    exit 0
+    ;;
+  -d | --delete)
+    KEEP_ARCHIVES=false
+    shift
+    ;;
+  *)
+    TARGET_DIR="$1"
+    shift
+    ;;
+  esac
 done
 
 # Check if directory argument is provided
 if [ -z "$TARGET_DIR" ]; then
-    echo "Usage: $0 [-d|--delete] <directory>"
-    echo "  -d, --delete    Delete tar.gz files after extraction (default: keep)"
-    exit 1
+  echo "Error: no target directory specified" >&2
+  echo "Try '$0 --help' for more information." >&2
+  exit 1
 fi
 
 # Check if target directory exists
 if [ ! -d "$TARGET_DIR" ]; then
-    echo "Error: Directory '$TARGET_DIR' does not exist"
-    exit 1
+  echo "Error: Directory '$TARGET_DIR' does not exist" >&2
+  exit 1
 fi
 
 # Change to the target directory
@@ -35,26 +45,26 @@ cd "$TARGET_DIR" || exit 1
 
 # Find all .tar.gz, .tgz, and .tar files and extract them
 for archive in *.tar.gz *.tgz *.tar; do
-    # Skip if glob matched nothing
-    [ -e "$archive" ] || continue
+  # Skip if glob matched nothing
+  [ -e "$archive" ] || continue
 
-    # Auto-detect compression by extension
-    case "$archive" in
-        *.tar.gz|*.tgz)
-            echo "Extracting $archive (compressed)..."
-            tar -xzvf "$archive"
-            ;;
-        *.tar)
-            echo "Extracting $archive (uncompressed)..."
-            tar -xvf "$archive"
-            ;;
-    esac
+  # Auto-detect compression by extension
+  case "$archive" in
+  *.tar.gz | *.tgz)
+    echo "Extracting $archive (compressed)..."
+    tar -xzvf "$archive"
+    ;;
+  *.tar)
+    echo "Extracting $archive (uncompressed)..."
+    tar -xvf "$archive"
+    ;;
+  esac
 
-    # Remove archive if KEEP_ARCHIVES is false
-    if [ "$KEEP_ARCHIVES" = false ]; then
-        echo "Removing $archive..."
-        rm -f "$archive"
-    fi
+  # Remove archive if KEEP_ARCHIVES is false
+  if [ "$KEEP_ARCHIVES" = false ]; then
+    echo "Removing $archive..."
+    rm -f "$archive"
+  fi
 done
 
 echo "Done!"
