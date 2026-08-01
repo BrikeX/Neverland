@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+PORT=8000
+DIRECTORY=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -p | --port)
+    PORT="$2"
+    shift 2
+    ;;
+  -h | --help)
+    echo "Usage: $0 [OPTIONS] [directory]"
+    echo
+    echo "Serve files over HTTP so other devices on the network can download them."
+    echo
+    echo "Options:"
+    echo "  -p, --port PORT   Port to listen on (default: 8000)"
+    echo "  -h, --help        Show this help"
+    echo
+    echo "Examples:"
+    echo "  $0 ~/Documents"
+    echo "  $0 -p 9000 ~/Videos"
+    echo "  $0"
+    exit 0
+    ;;
+  -*)
+    echo "Error: Unknown option '$1'. Use -h for help." >&2
+    exit 1
+    ;;
+  *)
+    DIRECTORY="$1"
+    shift
+    ;;
+  esac
+done
+
+if [ -z "$DIRECTORY" ]; then
+  DIRECTORY="."
+fi
+
+if [ ! -d "$DIRECTORY" ]; then
+  echo "Error: '$DIRECTORY' is not a directory." >&2
+  exit 1
+fi
+
+if ! command -v python3 &>/dev/null; then
+  echo "Error: python3 is not installed." >&2
+  exit 1
+fi
+
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+if [ -z "$IP" ]; then
+  IP="<your-ip>"
+fi
+
+echo "Serving: $(cd "$DIRECTORY" && pwd)"
+echo "Open on the other device: http://${IP}:${PORT}"
+echo "Press Ctrl+C to stop."
+echo
+
+exec python3 -m http.server "$PORT" --directory "$DIRECTORY"
