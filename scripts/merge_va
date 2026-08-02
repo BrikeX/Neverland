@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+OUTPUT=""
+KEEP=false
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -o | --output)
+    OUTPUT="$2"
+    shift 2
+    ;;
+  -k | --keep)
+    KEEP=true
+    shift
+    ;;
+  -h | --help)
+    echo "Usage: $0 [OPTIONS] <video> <audio>"
+    echo
+    echo "Merge separate video and audio streams into a single file (lossless, no re-encode)."
+    echo "Automatically detects which file is video and which is audio regardless of argument order."
+    echo
+    echo "Options:"
+    echo "  -o, --output FILE   Output filename (default: derived from video filename)"
+    echo "  -k, --keep          Keep original input files (default: delete after merge)"
+    echo "  -h, --help          Show this help"
+    echo
+    echo "Examples:"
+    echo "  $0 video.mp4 audio.m4a"
+    echo "  $0 video.mp4 audio.m4a -o output.mp4"
+    echo "  $0 *.mp4    # works when there are exactly 2 mp4 files"
+    exit 0
+    ;;
+  -*)
+    echo "Error: Unknown option '$1'. Use -h for help." >&2
+    exit 1
+    ;;
+  *)
+    ARGS+=("$1")
+    shift
+    ;;
+  esac
+done
+
+if [ "${#ARGS[@]}" -ne 2 ]; then
+  echo "Error: Expected exactly 2 input files (video + audio), got ${#ARGS[@]}." >&2
+  echo "Use -h for help." >&2
+  exit 1
+fi
+
+if ! command -v ffmpeg &>/dev/null; then
+  echo "Error: ffmpeg is not installed." >&2
+  exit 1
+fi
+
+FILE_A="${ARGS[0]}"
+FILE_B="${ARGS[1]}"
+
+for f in "$FILE_A" "$FILE_B"; do
+  if [ ! -f "$f" ]; then
+    echo "Error: '$f' not found." >&2
+    exit 1
+  fi
+done
+
+get_stream_type() {
+  ffprobe -v quiet -show_entries stream=codec_type -of csv=p=0 "$1" | head -1
+}
+
+TYPE_A=$(get_stream_type "$FILE_A")
+TYPE_B=$(get_stream_type "$FILE_B")
+
+if [ "$TYPE_A" = "video" ] && [ "$TYPE_B" = "audio" ]; then
+  VIDEO="$FILE_A"
+  AUDIO="$FILE_B"
+elif [ "$TYPE_A" = "audio" ] && [ "$TYPE_B" = "video" ]; then
+  VIDEO="$FILE_B"
+  AUDIO="$FILE_A"
+else
+  SIZE_A=$(stat -c%s "$FILE_A")
+  SIZE_B=$(stat -c%s "$FILE_B")
+  if [ "$SIZE_A" -ge "$SIZE_B" ]; then
+    VIDEO="$FILE_A"
+    AUDIO="$FILE_B"
+  else
+    VIDEO="$FILE_B"
+    AUDIO="$FILE_A"
+  fi
+  echo "Warning: Could not detect stream types by codec; assuming larger file is video." >&2
+fi
+
+echo "Video: $VIDEO"
+echo "Audio: $AUDIO"
+
+if [ -z "$OUTPUT" ]; then
+  BASENAME="${VIDEO%.*}"
+  OUTPUT="${BASENAME}_merged.mp4"
+fi
+
+ffmpeg -i "$VIDEO" -i "$AUDIO" -c copy -map 0:v:0 -map 1:a:0 "$OUTPUT"
+
+echo "Output: $OUTPUT"
+
+if [ "$KEEP" = false ]; then
+  rm "$VIDEO" "$AUDIO"
+  echo "Removed originals."
+fi
