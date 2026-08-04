@@ -8,6 +8,10 @@ DIRECTORY=""
 while [[ $# -gt 0 ]]; do
   case $1 in
   -p | --port)
+    if [ $# -lt 2 ]; then
+      echo "Error: option '$1' requires a port number." >&2
+      exit 1
+    fi
     PORT="$2"
     shift 2
     ;;
@@ -15,6 +19,9 @@ while [[ $# -gt 0 ]]; do
     echo "Usage: $0 [OPTIONS] [directory]"
     echo
     echo "Serve files over HTTP so other devices on the network can download them."
+    echo
+    echo "If ufw is active, the port is temporarily allowed and the rule is"
+    echo "removed automatically when the script exits."
     echo
     echo "Options:"
     echo "  -p, --port PORT   Port to listen on (default: 8000)"
@@ -56,9 +63,32 @@ if [ -z "$IP" ]; then
   IP="<your-ip>"
 fi
 
+UFW_ADDED=0
+cleanup() {
+  if [ "$UFW_ADDED" = "1" ]; then
+    UFW_ADDED=0
+    if sudo ufw delete allow "$PORT"/tcp >/dev/null 2>&1; then
+      echo "Firewall: removed the temporary rule for port $PORT"
+    else
+      echo "Warning: could not remove the firewall rule for port $PORT; remove it manually with: " \
+        "sudo ufw delete allow $PORT/tcp" >&2
+    fi
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if systemctl is-active ufw >/dev/null 2>&1; then
+  if sudo ufw allow "$PORT"/tcp >/dev/null 2>&1; then
+    UFW_ADDED=1
+    echo "Firewall: temporarily allowed port $PORT"
+  else
+    echo "Warning: ufw is active but port $PORT could not be allowed; other devices may be blocked." >&2
+  fi
+fi
+
 echo "Serving: $(cd "$DIRECTORY" && pwd)"
 echo "Open on the other device: http://${IP}:${PORT}"
 echo "Press Ctrl+C to stop."
 echo
 
-exec python3 -m http.server "$PORT" --directory "$DIRECTORY"
+python3 -m http.server "$PORT" --directory "$DIRECTORY"
