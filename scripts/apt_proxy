@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CONF_FILE="/etc/apt/apt.conf.d/99-upgrade-proxy"
+DEFAULT_PROXY="http://127.0.0.1:7897"
+HOSTS=("download.docker.com" "linux.teamviewer.com")
+
+usage() {
+  echo "Usage: $0 <command> [options]"
+  echo
+  echo "Control the per-host APT proxy for the docker and teamviewer repositories."
+  echo "When enabled, only these two repositories are fetched through the proxy;"
+  echo "all other repositories are fetched directly."
+  echo
+  echo "Commands:"
+  echo "  on              Enable the proxy for the docker and teamviewer repos"
+  echo "  off             Disable it (APT fetches everything directly)"
+  echo "  status          Show the current configuration"
+  echo "  -h, --help      Show this help"
+  echo
+  echo "Options:"
+  echo "  -p, --proxy URL   Proxy to use with 'on' (default: $DEFAULT_PROXY)"
+  echo
+  echo "Examples:"
+  echo "  $0 on"
+  echo "  $0 on -p http://127.0.0.1:7890"
+  echo "  $0 off"
+  echo "  $0 status"
+}
+
+test_proxy() {
+  local hp host port
+  hp="${1#*://}"
+  hp="${hp%%/*}"
+  if [[ "$hp" != *:* ]]; then
+    echo "unknown"
+    return 0
+  fi
+  host="${hp%%:*}"
+  port="${hp##*:}"
+  if timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+    echo "reachable"
+  else
+    echo "not reachable"
+  fi
+}
+
+COMMAND="${1:-}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$COMMAND" in
+on | off | status) ;;
+-h | --help | "")
+  usage
+  exit 0
+  ;;
+*)
+  echo "Error: Unknown command '$COMMAND'. Use -h for help." >&2
+  exit 1
+  ;;
+esac
+
+PROXY="$DEFAULT_PROXY"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -p | --proxy)
+    if [ $# -lt 2 ]; then
+      echo "Error: option '$1' requires a URL." >&2
+      exit 1
+    fi
+    PROXY="$2"
+    shift 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "Error: Unknown option '$1'. Use -h for help." >&2
+    exit 1
+    ;;
+  esac
+done
+
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=()
+else
+  SUDO=(sudo)
+fi
+
+case "$COMMAND" in
+on)
+  {
+    echo "// Managed by scripts/apt_proxy (Neverland): routes only the docker and"
+    echo "// teamviewer APT repos through $PROXY. All other repos go direct."
+    echo "// Requires the proxy to be running; if it is off, these two repos will fail."
+    echo 'Acquire::http::Proxy "DIRECT";'
+    echo 'Acquire::https::Proxy "DIRECT";'
+    for host in "${HOSTS[@]}"; do
+      echo "Acquire::http::Proxy::$host \"$PROXY\";"
+      echo "Acquire::https::Proxy::$host \"$PROXY\";"
+    done
+    echo 'Acquire::Retries "5";'
+  } | "${SUDO[@]}" tee "$CONF_FILE" >/dev/null
+  echo "Enabled: docker and teamviewer repos now fetch through $PROXY"
+  echo "Config: $CONF_FILE"
+  if [ "$(test_proxy "$PROXY")" != "reachable" ]; then
+    echo "Warning: $PROXY is not reachable right now; those two repos will fail" >&2
+    echo "         to fetch until the proxy is running." >&2
+  fi
+  ;;
+off)
+  if [ ! -e "$CONF_FILE" ]; then
+    echo "Already disabled: $CONF_FILE does not exist."
+    exit 0
+  fi
+  "${SUDO[@]}" rm -f "$CONF_FILE"
+  echo "Disabled: APT now fetches every repository directly."
+  ;;
+status)
+  if [ -e "$CONF_FILE" ]; then
+    echo "State: enabled ($CONF_FILE)"
+    PROXY="$(sed -n 's/^Acquire::https::Proxy::download\.docker\.com "\(.*\)";$/\1/p' "$CONF_FILE" | head -1)"
+    if [ -n "$PROXY" ]; then
+      echo "Proxy: $PROXY ($(test_proxy "$PROXY"))"
+    fi
+    echo "Affected repos:"
+    for host in "${HOSTS[@]}"; do
+      echo "  $host"
+    done
+    echo
+    echo "Effective APT configuration:"
+    apt-config dump 2>/dev/null | grep -iE "Proxy|Retries" | sed 's/^/  /' || true
+  else
+    echo "State: disabled ($CONF_FILE does not exist; APT fetches everything directly)"
+  fi
+  ;;
+esac
