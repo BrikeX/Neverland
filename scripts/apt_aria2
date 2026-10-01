@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CACHE_DIR=/var/cache/apt/archives
+CONNECTIONS=8
+DRY_RUN=0
+
+usage() {
+  echo "Usage: $0 [-x N] <package> [package...]"
+  echo
+  echo "Download .deb packages with aria2, using multiple parallel connections,"
+  echo "and stage them into APT's cache. A later 'apt-get install' then installs"
+  echo "them without downloading."
+  echo
+  echo "Meant for big debs from servers that throttle one connection at a time"
+  echo "(e.g. google-chrome-stable): $CONNECTIONS connections multiply throughput."
+  echo
+  echo "Options:"
+  echo "  -x, --connections N   Connections per file (default: $CONNECTIONS)"
+  echo "  -n, --dry-run         Show what would be downloaded; download nothing"
+  echo "  -h, --help            Show this help"
+  echo
+  echo "Examples:"
+  echo "  $0 google-chrome-stable"
+  echo "  $0 -n google-chrome-stable"
+  echo "  $0 -x 16 google-chrome-stable code"
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=()
+else
+  SUDO=(sudo)
+fi
+
+PACKAGES=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -x | --connections)
+    if [ $# -lt 2 ]; then
+      echo "Error: option '$1' requires a number." >&2
+      exit 1
+    fi
+    CONNECTIONS="$2"
+    shift 2
+    ;;
+  -n | --dry-run)
+    DRY_RUN=1
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -*)
+    echo "Error: Unknown option '$1'. Use -h for help." >&2
+    exit 1
+    ;;
+  *)
+    PACKAGES+=("$1")
+    shift
+    ;;
+  esac
+done
+
+if [ ${#PACKAGES[@]} -eq 0 ]; then
+  usage
+  exit 0
+fi
+
+if [ "$DRY_RUN" -eq 0 ] && ! command -v aria2c >/dev/null; then
+  echo "Error: aria2c is not installed. Install it with: sudo apt-get install aria2" >&2
+  exit 1
+fi
+
+stage_package() {
+  local pkg="$1" line url filename size hash dest workdir actual actual_hash expected
+  line="$(LC_ALL=C apt-get download --print-uris "$pkg" 2>/dev/null | head -n1 || true)"
+  if [[ -z "$line" || "$line" != \'* ]]; then
+    echo "Error: cannot resolve package '$pkg' (no download candidate)" >&2
+    return 1
+  fi
+  read -r url filename size hash <<<"$line"
+  url="${url#\'}"
+  url="${url%\'}"
+  dest="$CACHE_DIR/$filename"
+
+  if [ -e "$dest" ] && [ "$(stat -c%s "$dest")" = "$size" ]; then
+    echo "== $pkg: already staged in APT cache ($filename)"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "== $pkg: would download (dry run)"
+    echo "   URL:      $url"
+    echo "   file:     $filename ($size bytes)"
+    echo "   checksum: $hash"
+    echo "   stage as: $dest"
+    return 0
+  fi
+
+  workdir="$(mktemp -d)"
+  echo "== $pkg: downloading $filename ($size bytes, $CONNECTIONS connections)"
+  if ! aria2c -x "$CONNECTIONS" -s "$CONNECTIONS" -k 1M --max-tries=5 \
+    --retry-wait=2 --summary-interval=0 --dir "$workdir" -o "$filename" "$url"; then
+    echo "Error: aria2c failed for '$pkg'" >&2
+    rm -rf "$workdir"
+    return 1
+  fi
+
+  actual="$(stat -c%s "$workdir/$filename")"
+  if [ "$actual" != "$size" ]; then
+    echo "Error: size mismatch for '$pkg' (expected $size, got $actual)" >&2
+    rm -rf "$workdir"
+    return 1
+  fi
+  expected=""
+  case "$hash" in
+  SHA256:*)
+    expected="${hash#SHA256:}"
+    actual_hash="$(sha256sum "$workdir/$filename" | cut -d' ' -f1)"
+    ;;
+  SHA512:*)
+    expected="${hash#SHA512:}"
+    actual_hash="$(sha512sum "$workdir/$filename" | cut -d' ' -f1)"
+    ;;
+  esac
+  if [ -z "$expected" ]; then
+    echo "Warning: unknown checksum type in metadata for '$pkg'; skipping hash check" >&2
+  elif [ "$actual_hash" != "$expected" ]; then
+    echo "Error: ${hash%%:*} mismatch for '$pkg'; file discarded" >&2
+    rm -rf "$workdir"
+    return 1
+  fi
+
+  "${SUDO[@]}" mv -f "$workdir/$filename" "$CACHE_DIR/"
+  "${SUDO[@]}" chown root:root "$CACHE_DIR/$filename"
+  rm -rf "$workdir"
+  echo "== $pkg: staged as $CACHE_DIR/$filename"
+  return 0
+}
+
+failed=0
+staged=()
+for pkg in "${PACKAGES[@]}"; do
+  if stage_package "$pkg"; then
+    staged+=("$pkg")
+  else
+    failed=1
+  fi
+done
+
+if [ ${#staged[@]} -gt 0 ]; then
+  echo
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "Dry run: nothing was downloaded or staged."
+  else
+    INSTALL_CMD="apt-get install"
+    if [ ${#SUDO[@]} -gt 0 ]; then
+      INSTALL_CMD="sudo $INSTALL_CMD"
+    fi
+    echo "Install with:"
+    echo "  $INSTALL_CMD ${staged[*]}"
+  fi
+fi
+
+exit "$failed"
