@@ -1,0 +1,8 @@
+[project]
+name = "neverland"
+version = "0.1.0"
+description = "My playground."
+requires-python = ">=3.12"
+dependencies = [
+    "pyexiftool>=0.5.6",
+]
