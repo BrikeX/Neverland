@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+
+# Environment changes only affect the shell this runs in, so 'on' and 'off'
+# must be sourced or eval'd:
+#   source proxy on        |        eval "$(proxy on)"
+
+DEFAULT_PROXY="http://127.0.0.1:7897"
+NO_PROXY_VALUE="localhost,127.0.0.1,::1"
+PX_VARS=(http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY)
+SELF="${BASH_SOURCE[0]}"
+
+_pxy_sourced=false
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+  _pxy_sourced=true
+fi
+
+if [ "$_pxy_sourced" = false ]; then
+  set -euo pipefail
+fi
+
+_pxy_usage() {
+  echo "Usage: source $SELF <command> [options]"
+  echo "   or: eval \"\$($SELF on)\""
+  echo
+  echo "Set, clear or inspect the proxy environment variables (http_proxy,"
+  echo "https_proxy, all_proxy, no_proxy) for the current shell, e.g. to route"
+  echo "curl, pip, git and hf through Clash Verge."
+  echo
+  echo "Commands:"
+  echo "  on              Set the variables in the current shell"
+  echo "  off             Unset them in the current shell"
+  echo "  status          Show current values and proxy reachability"
+  echo "  -h, --help      Show this help"
+  echo
+  echo "Options:"
+  echo "  -p, --proxy URL   Proxy for 'on' (default: $DEFAULT_PROXY)"
+  echo
+  echo "Examples:"
+  echo "  source $SELF on"
+  echo "  eval \"\$($SELF on -p http://127.0.0.1:7890)\""
+  echo "  source $SELF off"
+  echo "  $SELF status"
+}
+
+_pxy_test_proxy() {
+  local hp host port
+  hp="${1#*://}"
+  hp="${hp%%/*}"
+  hp="${hp##*@}"
+  if [[ "$hp" != *:* ]]; then
+    echo "unknown"
+    return 0
+  fi
+  host="${hp%%:*}"
+  port="${hp##*:}"
+  if timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+    echo "reachable"
+  else
+    echo "not reachable"
+  fi
+}
+
+_pxy_apply() {
+  local p="$1"
+  export http_proxy="$p" HTTP_PROXY="$p"
+  export https_proxy="$p" HTTPS_PROXY="$p"
+  # all_proxy mirrors the URL; a socks5 URL needs the socksio package for httpx tools like hf
+  export all_proxy="$p" ALL_PROXY="$p"
+  export no_proxy="$NO_PROXY_VALUE" NO_PROXY="$NO_PROXY_VALUE"
+}
+
+_pxy_clear() {
+  unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+}
+
+_pxy_emit_on() {
+  local p="$1"
+  echo "export http_proxy=\"$p\""
+  echo "export HTTP_PROXY=\"$p\""
+  echo "export https_proxy=\"$p\""
+  echo "export HTTPS_PROXY=\"$p\""
+  echo "export all_proxy=\"$p\""
+  echo "export ALL_PROXY=\"$p\""
+  echo "export no_proxy=\"$NO_PROXY_VALUE\""
+  echo "export NO_PROXY=\"$NO_PROXY_VALUE\""
+}
+
+_pxy_emit_off() {
+  echo "unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY"
+}
+
+_pxy_show_status() {
+  local var active=""
+  echo "Proxy variables in this shell:"
+  for var in "${PX_VARS[@]}"; do
+    if [ -v "$var" ] && [ -n "${!var}" ]; then
+      echo "  $var = ${!var}"
+      active="${!var}"
+    fi
+  done
+  [ "$active" = "" ] && echo "  (none set)"
+  local https_like=""
+  for var in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY; do
+    if [ -v "$var" ] && [ -n "${!var}" ]; then
+      https_like="${!var}"
+      break
+    fi
+  done
+  echo
+  if [ -n "$https_like" ]; then
+    echo "Reachability of $https_like: $(_pxy_test_proxy "$https_like")"
+  else
+    echo "Reachability of default $DEFAULT_PROXY: $(_pxy_test_proxy "$DEFAULT_PROXY") (default; no proxy set in this shell)"
+  fi
+}
+
+_pxy_main() {
+  local command="${1:-}"
+  local hint_cmd="$*"
+  if [ $# -gt 0 ]; then
+    shift
+  fi
+
+  case "$command" in
+  on | off | status) ;;
+  -h | --help | "")
+    _pxy_usage
+    return 0
+    ;;
+  *)
+    echo "Error: Unknown command '$command'. Use -h for help." >&2
+    return 1
+    ;;
+  esac
+
+  local proxy="$DEFAULT_PROXY"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    -p | --proxy)
+      if [ $# -lt 2 ]; then
+        echo "Error: option '$1' requires a URL." >&2
+        return 1
+      fi
+      proxy="$2"
+      shift 2
+      ;;
+    -h | --help)
+      _pxy_usage
+      return 0
+      ;;
+    *)
+      echo "Error: Unknown option '$1'. Use -h for help." >&2
+      return 1
+      ;;
+    esac
+  done
+
+  case "$command" in
+  on)
+    if [ "$_pxy_sourced" = true ]; then
+      _pxy_apply "$proxy"
+      echo "Enabled for this shell:"
+      echo "  http_proxy / https_proxy / all_proxy = $proxy"
+      echo "  no_proxy                             = $NO_PROXY_VALUE"
+    else
+      _pxy_emit_on "$proxy"
+    fi
+    if [ "$(_pxy_test_proxy "$proxy")" != "reachable" ]; then
+      echo "Warning: $proxy is not reachable right now; is Clash Verge running?" >&2
+    fi
+    ;;
+  off)
+    if [ "$_pxy_sourced" = true ]; then
+      _pxy_clear
+      echo "Disabled for this shell: proxy variables unset."
+    else
+      _pxy_emit_off
+    fi
+    ;;
+  status)
+    _pxy_show_status
+    ;;
+  esac
+
+  if [ "$_pxy_sourced" = false ] && [ -t 1 ] && [ "$command" != "status" ]; then
+    echo "Nothing was changed in this shell; to apply, run one of:" >&2
+    echo "  source $SELF $hint_cmd" >&2
+    echo "  eval \"\$($SELF $hint_cmd)\"" >&2
+  fi
+}
+
+_pxy_result=0
+_pxy_main "$@" || _pxy_result=$?
+
+unset -f _pxy_main _pxy_usage _pxy_test_proxy _pxy_apply _pxy_clear _pxy_emit_on _pxy_emit_off _pxy_show_status
+
+if [ "$_pxy_sourced" = true ]; then
+  unset SELF DEFAULT_PROXY NO_PROXY_VALUE PX_VARS
+  return "$_pxy_result"
+else
+  exit "$_pxy_result"
+fi
