@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+API_BASE="https://hub.docker.com/v2"
+
+usage() {
+  echo "Usage: $0 [OPTIONS] <image>[:tag]"
+  echo
+  echo "Print the official manifest digest (sha256) of a Docker Hub image tag."
+  echo "For multi-platform tags this is the manifest list digest, i.e. the"
+  echo "sha256 docker records in the image's RepoDigests after a pull."
+  echo
+  echo "Use it to verify a pull from a mirror: compare this digest with the one"
+  echo "the mirror serves (docker buildx imagetools inspect <mirror>/<image>:<tag>)."
+  echo
+  echo "Docker Hub is blocked on some networks; enable the proxy for the shell"
+  echo "you run this in first:"
+  echo "  eval \"\$($SCRIPT_DIR/proxy on)\""
+  echo
+  echo "Options:"
+  echo "  -i, --info      Show size, update date and per-platform digests too"
+  echo "  -h, --help      Show this help"
+  echo
+  echo "Examples:"
+  echo "  $0 nvidia/cuda:12.9.2-cudnn-devel-ubuntu24.04"
+  echo "  $0 ubuntu                     # library/ubuntu:latest"
+  echo "  $0 -i nvidia/cuda:12.9.2-cudnn-devel-ubuntu24.04"
+}
+
+for dep in curl jq; do
+  if ! command -v "$dep" &>/dev/null; then
+    echo "Error: $dep is not installed." >&2
+    exit 1
+  fi
+done
+
+IMAGE=""
+INFO=0
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -i | --info)
+    INFO=1
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -*)
+    echo "Error: Unknown option '$1'. Use -h for help." >&2
+    exit 1
+    ;;
+  *)
+    if [ -n "$IMAGE" ]; then
+      echo "Error: only one image can be queried at a time." >&2
+      exit 1
+    fi
+    IMAGE="$1"
+    shift
+    ;;
+  esac
+done
+
+if [ -z "$IMAGE" ]; then
+  usage >&2
+  exit 1
+fi
+
+REF="$IMAGE"
+
+if [[ "$REF" == *@* ]]; then
+  echo "Error: '$IMAGE' is a digest reference; pass an image tag instead." >&2
+  exit 1
+fi
+
+if [[ "${REF%%/*}" == *[.:]* || "${REF%%/*}" == "localhost" ]]; then
+  HOST="${REF%%/*}"
+  REF="${REF#*/}"
+  case "$HOST" in
+  docker.io | index.docker.io | registry-1.docker.io | hub.docker.com) ;;
+  *)
+    echo "Error: '$HOST' is not Docker Hub; pass a Docker Hub reference like 'nvidia/cuda:tag'." >&2
+    exit 1
+    ;;
+  esac
+fi
+
+TAG="latest"
+if [[ "$REF" == *:* ]]; then
+  TAG="${REF##*:}"
+  REF="${REF%:*}"
+fi
+
+if ! [[ "$TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+  echo "Error: '$TAG' is not a valid image tag." >&2
+  exit 1
+fi
+
+case "$REF" in
+*/*/*)
+  echo "Error: '$IMAGE' has too many path segments for a Docker Hub repository." >&2
+  exit 1
+  ;;
+*/*)
+  NAMESPACE="${REF%%/*}"
+  REPO="${REF##*/}"
+  ;;
+*)
+  NAMESPACE="library"
+  REPO="$REF"
+  ;;
+esac
+
+URL="$API_BASE/namespaces/$NAMESPACE/repositories/$REPO/tags/$TAG"
+
+if ! RESPONSE="$(curl -sS --connect-timeout 10 --max-time 30 -w 'HTTP_STATUS:%{http_code}' "$URL")"; then
+  echo -n "Error: could not reach hub.docker.com." >&2
+  if [ -n "${https_proxy:-}${HTTPS_PROXY:-}" ]; then
+    echo " Is the proxy at ${https_proxy:-$HTTPS_PROXY} running?" >&2
+  else
+    echo " Docker Hub is blocked on some networks; enable the proxy first:" >&2
+    echo "  eval \"\$($SCRIPT_DIR/proxy on)\"" >&2
+  fi
+  exit 1
+fi
+
+STATUS="${RESPONSE##*HTTP_STATUS:}"
+BODY="${RESPONSE%HTTP_STATUS:*}"
+
+case "$STATUS" in
+200) ;;
+404)
+  echo "Error: no tag '$TAG' in $NAMESPACE/$REPO on Docker Hub." >&2
+  exit 1
+  ;;
+429)
+  echo "Error: Docker Hub rate limit reached (HTTP 429); try again later." >&2
+  exit 1
+  ;;
+*)
+  echo "Error: Docker Hub returned HTTP $STATUS." >&2
+  exit 1
+  ;;
+esac
+
+DIGEST="$(jq -r '.digest // empty' <<<"$BODY")"
+
+if [ -z "$DIGEST" ]; then
+  echo "Error: Docker Hub returned no digest for $NAMESPACE/$REPO:$TAG." >&2
+  exit 1
+fi
+
+if [ "$INFO" = "0" ]; then
+  echo "$DIGEST"
+  exit 0
+fi
+
+echo "$NAMESPACE/$REPO:$TAG"
+jq -r '
+  "Manifest digest: \(.digest)",
+  "Size:            \((.full_size * 100 / 1e9 | round) / 100) GB (uncompressed)",
+  "Updated:         \(.last_updated[0:16] | sub("T"; " ")) UTC",
+  "Platforms:",
+  (.images // [] | .[] | select((.status // "active") == "active") |
+    "  \(.os)/\(.architecture)\(if (.variant // "") == "" then "" else "/" + .variant end)  \(.digest)")
+' <<<"$BODY"

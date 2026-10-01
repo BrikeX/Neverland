@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Mirrors are tested in this order; edit the list to add or remove mirrors.
+MIRRORS=(
+  "https://docker.1ms.run"
+  "https://docker.1panel.live"
+  "https://docker.sparkcr.cn"
+  "https://hub.rat.dev"
+  "https://dockerproxy.net"
+  "https://docker-registry.nmqu.com"
+  "https://hub1.nat.tf"
+  "https://hub4.nat.tf"
+  "https://docker.m.daocloud.io"
+  "https://dockerproxy.cool"
+  "https://docker.jiaxin.site"
+  "https://proxy.vvvv.ee"
+  "https://free.hubfast.cn"
+)
+
+SHA_FILE="sha256.txt"
+SAMPLE_MIB=10
+QUIET=0
+PULL_CHECK=1
+PULL_CHECK_TIMEOUT=60
+PULL_CHECK_IMAGE="hello-world"
+
+CONNECT_TIMEOUT=5
+SMALL_MAX_TIME=12
+BLOB_MAX_TIME=25
+ACCEPT_MANIFEST="application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json"
+
+usage() {
+  echo "Usage: $0 [OPTIONS] <image>[:tag]"
+  echo
+  echo "Test the Docker Hub mirrors listed in this script: fetch the manifest of"
+  echo "<image>:<tag> from each mirror, verify it against the expected sha256"
+  echo "digest, measure the download speed of a sample blob, then print the"
+  echo "fastest mirror that serves the expected digest."
+  echo
+  echo "The fastest candidates are then checked with the local Docker daemon:"
+  echo "it actually pulls a tiny hello-world image through each candidate"
+  echo "(fastest first) and the first success is chosen. This catches mirrors"
+  echo "that serve the right digest but fail real pulls. Skipped when docker"
+  echo "is unavailable."
+  echo
+  echo "Options:"
+  echo "  -f, --file FILE   Digest file to check against (default: $SHA_FILE)"
+  echo "  -s, --sample MIB  Download sample size per mirror, in MiB (default: $SAMPLE_MIB)"
+  echo "  -q, --quiet       Only print the fastest matching mirror"
+  echo "  --no-pull-check   Skip the daemon pull check"
+  echo "  -h, --help        Show this help"
+  echo
+  echo "Examples:"
+  echo "  $0 nvidia/cuda:12.9.2-cudnn-devel-ubuntu24.04"
+  echo "  $0 -q nvidia/cuda:12.9.2-cudnn-devel-ubuntu24.04"
+  echo "  $0 -f other.sha256 -s 5 ubuntu"
+}
+
+for dep in curl jq sha256sum; do
+  if ! command -v "$dep" &>/dev/null; then
+    echo "Error: $dep is not installed." >&2
+    exit 1
+  fi
+done
+
+IMAGE=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -f | --file)
+    if [ $# -lt 2 ]; then
+      echo "Error: option '$1' requires a file." >&2
+      exit 1
+    fi
+    SHA_FILE="$2"
+    shift 2
+    ;;
+  -s | --sample)
+    if [ $# -lt 2 ]; then
+      echo "Error: option '$1' requires a size in MiB." >&2
+      exit 1
+    fi
+    SAMPLE_MIB="$2"
+    shift 2
+    ;;
+  -q | --quiet)
+    QUIET=1
+    shift
+    ;;
+  --no-pull-check)
+    PULL_CHECK=0
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -*)
+    echo "Error: Unknown option '$1'. Use -h for help." >&2
+    exit 1
+    ;;
+  *)
+    if [ -n "$IMAGE" ]; then
+      echo "Error: only one image can be tested at a time." >&2
+      exit 1
+    fi
+    IMAGE="$1"
+    shift
+    ;;
+  esac
+done
+
+if [ -z "$IMAGE" ]; then
+  usage >&2
+  exit 1
+fi
+
+if ! [[ "$SAMPLE_MIB" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: sample size must be a positive integer (MiB)." >&2
+  exit 1
+fi
+
+if [ ! -f "$SHA_FILE" ]; then
+  echo "Error: digest file '$SHA_FILE' not found (use -f FILE)." >&2
+  exit 1
+fi
+EXPECTED="$(tr -d '[:space:]' <"$SHA_FILE")"
+if ! [[ "$EXPECTED" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "Error: '$SHA_FILE' does not contain a single sha256:<hex> digest." >&2
+  exit 1
+fi
+
+REF="$IMAGE"
+
+if [[ "$REF" == *@* ]]; then
+  echo "Error: '$IMAGE' is a digest reference; pass an image tag instead." >&2
+  exit 1
+fi
+
+if [[ "${REF%%/*}" == *[.:]* || "${REF%%/*}" == "localhost" ]]; then
+  HOST="${REF%%/*}"
+  REF="${REF#*/}"
+  case "$HOST" in
+  docker.io | index.docker.io | registry-1.docker.io | hub.docker.com) ;;
+  *)
+    echo "Error: '$HOST' is not Docker Hub; pass a Docker Hub reference like 'nvidia/cuda:tag'." >&2
+    exit 1
+    ;;
+  esac
+fi
+
+TAG="latest"
+if [[ "$REF" == *:* ]]; then
+  TAG="${REF##*:}"
+  REF="${REF%:*}"
+fi
+
+if ! [[ "$TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+  echo "Error: '$TAG' is not a valid image tag." >&2
+  exit 1
+fi
+
+case "$REF" in
+*/*/*)
+  echo "Error: '$IMAGE' has too many path segments for a Docker Hub repository." >&2
+  exit 1
+  ;;
+*/*)
+  FULLREPO="$REF"
+  ;;
+*)
+  FULLREPO="library/$REF"
+  ;;
+esac
+
+case "$(uname -m)" in
+x86_64) PLATFORM_ARCH="amd64" ;;
+aarch64 | arm64) PLATFORM_ARCH="arm64" ;;
+*) PLATFORM_ARCH="$(uname -m)" ;;
+esac
+
+if [ -n "${https_proxy:-}${HTTPS_PROXY:-}" ]; then
+  echo "Note: a proxy is set (${https_proxy:-$HTTPS_PROXY}); tests will go through it." >&2
+  echo "      Run with the proxy off for accurate mirror speeds." >&2
+fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+elapsed_ms() {
+  echo $((($(date +%s%N) - $1) / 1000000))
+}
+
+# Prints one line: "<speed_bytes_per_sec> <latency_ms> <status> <detail>"
+probe_mirror() {
+  local base="$1"
+  local h1="$WORK/h1" h2="$WORK/h2" b1="$WORK/body1" b2="$WORK/body2"
+  local hdrfile="" token="" code="" start
+  local -a auth=()
+  rm -f "$h1" "$h2" "$b1" "$b2"
+
+  start="$(date +%s%N)"
+
+  if ! code="$(curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$SMALL_MAX_TIME" \
+    -o "$b1" -D "$h1" -H "Accept: $ACCEPT_MANIFEST" \
+    -w '%{http_code}' "$base/v2/$FULLREPO/manifests/$TAG" 2>/dev/null)"; then
+    echo "0 $(elapsed_ms "$start") fail unreachable"
+    return 0
+  fi
+
+  if [ "$code" = "200" ]; then
+    hdrfile="$h1"
+  elif [ "$code" = "401" ]; then
+    local realm service scope query turl tj
+    realm="$(grep -i '^www-authenticate:' "$h1" | head -1 | grep -io 'realm="[^"]*"' | cut -d'"' -f2 || true)"
+    service="$(grep -i '^www-authenticate:' "$h1" | head -1 | grep -io 'service="[^"]*"' | cut -d'"' -f2 || true)"
+    scope="$(grep -i '^www-authenticate:' "$h1" | head -1 | grep -io 'scope="[^"]*"' | cut -d'"' -f2 || true)"
+    if [ -z "$realm" ]; then
+      echo "0 $(elapsed_ms "$start") fail auth-realm-missing"
+      return 0
+    fi
+    query=""
+    if [ -n "$service" ]; then
+      query="service=$service"
+    fi
+    query="${query:+$query&}scope=${scope:-repository:$FULLREPO:pull}"
+    if [[ "$realm" == *\?* ]]; then
+      turl="$realm&$query"
+    else
+      turl="$realm?$query"
+    fi
+    if ! tj="$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$SMALL_MAX_TIME" "$turl" 2>/dev/null)"; then
+      echo "0 $(elapsed_ms "$start") fail auth-unreachable"
+      return 0
+    fi
+    token="$(jq -r '.token // .access_token // empty' <<<"$tj" 2>/dev/null || true)"
+    if [ -z "$token" ]; then
+      echo "0 $(elapsed_ms "$start") fail auth-failed"
+      return 0
+    fi
+    auth=(-H "Authorization: Bearer $token")
+    if ! code="$(curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$SMALL_MAX_TIME" \
+      -o "$b1" -D "$h2" -H "Accept: $ACCEPT_MANIFEST" "${auth[@]}" \
+      -w '%{http_code}' "$base/v2/$FULLREPO/manifests/$TAG" 2>/dev/null)"; then
+      echo "0 $(elapsed_ms "$start") fail manifest-unreachable"
+      return 0
+    fi
+    hdrfile="$h2"
+  else
+    echo "0 $(elapsed_ms "$start") fail http-$code"
+    return 0
+  fi
+
+  if [ "$code" != "200" ]; then
+    echo "0 $(elapsed_ms "$start") fail http-$code"
+    return 0
+  fi
+
+  local latency
+  latency="$(elapsed_ms "$start")"
+
+  local dcd computed
+  dcd="$(grep -i '^docker-content-digest:' "$hdrfile" | head -1 | tr -d '\r' | awk '{print $2}' || true)"
+  computed="sha256:$(sha256sum "$b1" | cut -d' ' -f1)"
+  if [ "$computed" != "$EXPECTED" ] || { [ -n "$dcd" ] && [ "$dcd" != "$EXPECTED" ]; }; then
+    echo "0 $latency mismatch got=${computed:0:20}..."
+    return 0
+  fi
+
+  local pd_digest layer_json
+  pd_digest="$(jq -r --arg arch "$PLATFORM_ARCH" \
+    '(.manifests // [])[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' \
+    "$b1" 2>/dev/null | head -1 || true)"
+
+  layer_json="$b1"
+  if [ -n "$pd_digest" ]; then
+    if ! code="$(curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$SMALL_MAX_TIME" \
+      -o "$b2" -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+      "${auth[@]}" -w '%{http_code}' "$base/v2/$FULLREPO/manifests/$pd_digest" 2>/dev/null)"; then
+      echo "0 $latency fail platform-unreachable"
+      return 0
+    fi
+    if [ "$code" != "200" ]; then
+      echo "0 $latency fail platform-http-$code"
+      return 0
+    fi
+    if [ "sha256:$(sha256sum "$b2" | cut -d' ' -f1)" != "$pd_digest" ]; then
+      echo "0 $latency fail platform-digest-mismatch"
+      return 0
+    fi
+    layer_json="$b2"
+  fi
+
+  local blob
+  blob="$(jq -r '[.layers[]? | select(.size != null)] | max_by(.size) | .digest // empty' "$layer_json" 2>/dev/null || true)"
+  if [ -z "$blob" ]; then
+    echo "0 $latency fail no-layers"
+    return 0
+  fi
+
+  local sample_bytes=$((SAMPLE_MIB * 1024 * 1024))
+  local out rc=0 bcode sp bbytes
+  out="$(curl -sS -L -o /dev/null --connect-timeout "$CONNECT_TIMEOUT" --max-time "$BLOB_MAX_TIME" \
+    -r "0-$((sample_bytes - 1))" --max-filesize $((sample_bytes * 4)) \
+    "${auth[@]}" -w '%{http_code} %{speed_download} %{size_download}' \
+    "$base/v2/$FULLREPO/blobs/$blob" 2>/dev/null)" || rc=$?
+  # rc 28 (max-time hit) and 63 (full download capped by --max-filesize) still carry usable numbers
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 28 ] && [ "$rc" -ne 63 ]; then
+    echo "0 $latency fail blob-failed"
+    return 0
+  fi
+  bcode="${out%% *}"
+  out="${out#* }"
+  sp="${out%% *}"
+  bbytes="${out##* }"
+  case "$bcode" in
+  200 | 206) ;;
+  *)
+    echo "0 $latency fail blob-http-$bcode"
+    return 0
+    ;;
+  esac
+  if ! awk -v s="$bbytes" 'BEGIN { exit !(s > 0) }'; then
+    echo "0 $latency fail blob-empty"
+    return 0
+  fi
+  echo "$sp $latency ok -"
+}
+
+total="${#MIRRORS[@]}"
+if [ "$QUIET" = "0" ]; then
+  echo "Testing $total mirrors for $IMAGE"
+  echo "Expected: $EXPECTED (from $SHA_FILE)"
+  echo
+fi
+
+results=()
+i=0
+for base in "${MIRRORS[@]}"; do
+  i=$((i + 1))
+  base="${base%/}"
+  if [ "$QUIET" = "0" ]; then
+    printf '[%d/%d] %-28s ' "$i" "$total" "${base#*://}" >&2
+  fi
+  line="$(probe_mirror "$base")"
+  read -r speed latency status detail <<<"$line"
+  if [ "$QUIET" = "0" ]; then
+    if [ "$status" = "ok" ]; then
+      awk -v s="$speed" 'BEGIN { printf "ok  %.1f MB/s\n", s / 1048576 }' >&2
+    else
+      printf '%s %s\n' "$status" "$detail" >&2
+    fi
+  fi
+  results+=("$speed $latency $status $detail $base")
+done
+
+sorted="$(printf '%s\n' "${results[@]}" | LC_ALL=C sort -k1,1rn -k2,2n)"
+
+if [ "$QUIET" = "0" ]; then
+  echo
+  printf '%3s  %-28s %8s %12s  %s\n' "#" "MIRROR" "LATENCY" "SPEED" "STATUS"
+fi
+
+ok_bases=()
+rank=0
+while read -r speed latency status detail base; do
+  if [ "$status" = "ok" ]; then
+    rank=$((rank + 1))
+    ok_bases+=("$base")
+  fi
+  if [ "$QUIET" = "1" ]; then
+    continue
+  fi
+  host="${base#*://}"
+  if [ "$status" = "ok" ]; then
+    spd="$(awk -v s="$speed" 'BEGIN { printf "%.1f MB/s", s / 1048576 }')"
+    printf '%3d  %-28s %6sms %12s  ok\n' "$rank" "$host" "$latency" "$spd"
+  else
+    lat_disp="-"
+    if [ "$latency" -gt 0 ]; then
+      lat_disp="${latency}ms"
+    fi
+    printf '%3s  %-28s %8s %12s  %s %s\n' "-" "$host" "$lat_disp" "-" "$status" "$detail"
+  fi
+done <<<"$sorted"
+
+if [ "${#ok_bases[@]}" -eq 0 ]; then
+  echo "Error: no mirror served the expected digest." >&2
+  exit 1
+fi
+
+chosen="${ok_bases[0]}"
+chosen_verified=0
+pull_check_ran=0
+
+if [ "$PULL_CHECK" = "1" ]; then
+  if command -v docker &>/dev/null && timeout 5 docker info &>/dev/null; then
+    pull_check_ran=1
+    total_ok="${#ok_bases[@]}"
+    k=0
+    if [ "$QUIET" = "0" ]; then
+      echo >&2
+      echo "Pull check: pulling $PULL_CHECK_IMAGE:latest through each candidate via the Docker daemon" >&2
+    fi
+    for base in "${ok_bases[@]}"; do
+      k=$((k + 1))
+      host="${base#*://}"
+      probe_ref="$host/$PULL_CHECK_IMAGE:latest"
+      preexisting=0
+      if docker image inspect "$probe_ref" &>/dev/null; then
+        preexisting=1
+      fi
+      if [ "$QUIET" = "0" ]; then
+        printf '[pull %d/%d] %-28s ' "$k" "$total_ok" "$host" >&2
+      fi
+      pull_rc=0
+      pull_out="$(timeout "$PULL_CHECK_TIMEOUT" docker pull "$probe_ref" 2>&1)" || pull_rc=$?
+      if [ "$preexisting" = "0" ]; then
+        docker rmi "$probe_ref" &>/dev/null || true
+      fi
+      if [ "$pull_rc" -eq 0 ]; then
+        chosen="$base"
+        chosen_verified=1
+        if [ "$QUIET" = "0" ]; then
+          echo "ok" >&2
+        fi
+        break
+      fi
+      reason="$(grep -om1 'Error response from daemon: .*' <<<"$pull_out" || true)"
+      if [ -z "$reason" ]; then
+        if [ "$pull_rc" -eq 124 ]; then
+          reason="pull timed out after ${PULL_CHECK_TIMEOUT}s"
+        else
+          reason="pull failed (exit $pull_rc)"
+        fi
+      else
+        reason="${reason#Error response from daemon: }"
+      fi
+      if [ "$QUIET" = "0" ]; then
+        printf 'fail %s\n' "$reason" >&2
+      fi
+    done
+    if [ "$chosen_verified" = "0" ]; then
+      echo "Warning: every candidate failed the daemon pull check;" >&2
+      echo "         printing the fastest digest match, unverified." >&2
+    fi
+  else
+    echo "Warning: Docker daemon not reachable; skipping the pull check." >&2
+  fi
+fi
+
+if [ "$QUIET" = "1" ]; then
+  echo "${chosen#*://}"
+else
+  echo
+  if [ "$chosen_verified" = "1" ]; then
+    echo "Fastest match (daemon pull check passed): $chosen"
+  elif [ "$pull_check_ran" = "1" ]; then
+    echo "Fastest match (unverified: pull check failed for every candidate): $chosen"
+  else
+    echo "Fastest match: $chosen"
+  fi
+  echo "  docker pull ${chosen#*://}/$IMAGE"
+  echo "  Digest-pinned alternative (skips tag resolution; use if the pull above fails):"
+  echo "    docker pull ${chosen#*://}/$REF@$EXPECTED"
+fi
