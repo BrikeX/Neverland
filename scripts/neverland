@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+# Usage: add `source ~/Documents/Neverland/scripts/neverland` to ~/.bashrc
+
+neverland() {
+  cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." || return 1
+}
