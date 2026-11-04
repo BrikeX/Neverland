@@ -5,4 +5,5 @@ description = "My playground."
 requires-python = ">=3.12"
 dependencies = [
     "pyexiftool>=0.5.6",
+    "yt-dlp[curl-cffi,default]>=2026.10.26",
 ]
