@@ -34,3 +34,6 @@
 # Python
 .venv/
 __pycache__/
+
+# cookie files
+*.cookie
