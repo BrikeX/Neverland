@@ -1,0 +1,3 @@
+config:
+  # Command examples and skill descriptions intentionally exceed 80 columns.
+  MD013: false
