@@ -37,3 +37,6 @@ __pycache__/
 
 # cookie files
 *.cookie
+
+# tool-specific directories
+.qoder/
