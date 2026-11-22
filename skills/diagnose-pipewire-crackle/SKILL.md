@@ -1,6 +1,6 @@
 ---
 name: diagnose-pipewire-crackle
-description: Diagnose and fix Linux audio crackling, popping, or static on PipeWire when playback affects multiple outputs or appears network-related. Use when audio crackles during music, games, or video, when pw-top shows rising ERR counts or a very low graph quantum, when logs contain snd_pcm_mmap_commit "Broken pipe", or when a background ALSA client such as fluidsynth forces a small period size.
+description: Diagnose and fix Linux audio crackling, popping, or static on PipeWire when playback affects multiple outputs or appears network-related. Use when audio crackles during music, games, or video, when pw-top shows rising ERR counts or a very low graph quantum, when a low-latency game still xruns after a low-period client is fixed, when logs contain snd_pcm_mmap_commit "Broken pipe", or when a background ALSA client such as fluidsynth forces a small period size.
 ---
 
 # Diagnose PipeWire Crackle
@@ -13,6 +13,7 @@ Isolate audible crackle across PipeWire outputs and fix it by measuring the grap
 
 - PipeWire chooses the graph quantum from client latency requests, clamped by `clock.min-quantum` and `clock.max-quantum`, unless `clock.force-quantum` is set.
 - A background client with a tiny ALSA period can pin the whole graph low. At 48 kHz, 64 frames is 1.33 ms and commonly underruns several times per second.
+- A low quantum is risky under load without realtime scheduling; CPU contention can delay wakeups and cause xruns.
 - Graph-level underruns happen before output routing, so they affect speakers, wired headphones, and Bluetooth alike.
 - Wi-Fi or Ethernet correlation is often coincidental. Test it explicitly before pursuing driver theories.
 
@@ -109,10 +110,92 @@ If the daemon is unused, disable it instead:
 systemctl --user disable --now fluidsynth.service
 ```
 
+## Residual crackle under load: realtime scheduling
+
+A fixed low-period client can reveal a second layer: the remaining graph is still low, but PipeWire has no realtime scheduling. Check during playback:
+
+```bash
+pw-top -b -n 8
+ps -L -o pid,tid,cls,rtprio,comm -p "$(pgrep -d, -x pipewire)"
+```
+
+A sink at 128 frames (2.7 ms) with a rising `ERR`, and PipeWire threads in `TS`, means the graph is too tight for the current CPU load.
+
+Check the actual limit, not only the configured value:
+
+```bash
+systemctl --user show pipewire -p LimitRTPRIO
+main=$(systemctl --user show pipewire -p MainPID --value)
+grep -i 'max realtime priority' /proc/$main/limits
+```
+
+If the unit shows 95 but `/proc/.../limits` shows 0, the systemd user manager itself has a hard `RLIMIT_RTPRIO` of 0. An unprivileged user manager cannot raise that hard limit, so per-service drop-ins are clamped.
+
+Set the limit at the system level (replace 1000 with `id -u`):
+
+```bash
+sudo mkdir -p /etc/systemd/system/user@1000.service.d
+sudo tee /etc/systemd/system/user@1000.service.d/rt.conf >/dev/null <<'EOF'
+[Service]
+LimitRTPRIO=95
+LimitNICE=40
+EOF
+sudo systemctl daemon-reload
+```
+
+Log out and back in so the user manager inherits the limit. To test without logging out, raise the live manager limit as root and restart the audio services:
+
+```bash
+sudo prlimit --pid "$(pgrep -o -u "$USER" -x systemd)" --rtprio=95:95 --nice=40:40
+systemctl --user daemon-reload
+systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
+```
+
+Keep per-service limits too; module-rt asks for RT 88 and nice -11:
+
+```ini
+# ~/.config/systemd/user/pipewire.service.d/rt.conf
+# and ~/.config/systemd/user/pipewire-pulse.service.d/rt.conf
+[Service]
+LimitRTPRIO=95
+LimitNICE=40
+```
+
+Verify the main service's data loop:
+
+```bash
+ps -L -o pid,tid,cls,rtprio,comm -p "$(pgrep -d, -x pipewire)"
+```
+
+Expect `FF 88` on the main `pw-data-loop`. `LimitNICE=40` allows the `nice.level = -11` request; without it the main data loop can remain `TS` even when RT is permitted. `LimitNICE=31` is enough for -11 if you want a tighter ceiling.
+
+Test a low quantum under load:
+
+```bash
+pw-metadata -n settings 0 clock.min-quantum 128
+pw-top -b -n 15
+```
+
+If `ERR` stays flat, persist it; otherwise try 256 or 512:
+
+```ini
+# ~/.config/pipewire/pipewire.conf.d/10-min-quantum.conf
+context.properties = {
+    default.clock.min-quantum = 128
+}
+```
+
+Tradeoffs:
+
+- RT grants session-wide privileges; tighten `LimitRTPRIO` and `LimitNICE` where possible.
+- A 512-frame floor works without RT but costs about 10.7 ms; 128 frames with RT costs about 2.7 ms.
+- RT does not guarantee zero xruns under extreme load; keep a fallback floor.
+
 ## Verify
 
 - Replay the tone, then music or a game, on speakers, wired headphones, and Bluetooth.
 - Confirm the sink `ERR` delta is zero across snapshots and the graph quantum is stable.
+- For RT setups, confirm the main `pw-data-loop` reports `FF 88`, not `TS`.
 - Confirm no runtime override remains (`clock.force-quantum=0`).
 - Restore any temporary experiments and confirm their original values.
 
@@ -123,7 +206,10 @@ systemctl --user disable --now fluidsynth.service
 - Setting `default.clock.quantum` and assuming it sticks; client-requested minima override it.
 - Blaming the network driver. Disabling the radio is a stronger test than observing traffic correlation.
 - Blaming the Realtek codec when Bluetooth is also affected.
-- Adding realtime scheduling as a blind workaround. Check `systemctl --user show pipewire -p LimitRTPRIO` and `ps -L -o cls,rtprio,comm -p "$(pgrep -d, -x pipewire)"`, but fix measured underruns first.
+- Adding realtime scheduling as a blind workaround. Fix measured underruns first, then verify the actual `/proc/<pid>/limits` and `ps -L` state.
+- Trusting `systemctl --user show ... LimitRTPRIO` when the user manager's hard limit is 0; check `/proc/<pid>/limits`.
+- Setting `LimitRTPRIO` without `LimitNICE`; module-rt also requests nice -11 and may stay `TS`.
+- Leaving a 64/128-frame quantum without RT under load.
 
 ## Case notes
 
@@ -131,4 +217,6 @@ systemctl --user disable --now fluidsynth.service
 - Symptom: crackle during music, games, and video on speakers, wired headphones, and Bluetooth; unchanged with the Wi-Fi radio off.
 - Diagnosis: sink quantum 64 with `ERR` rising about 11 per second; the enabled user unit `fluidsynth.service` was requesting a 64-frame period.
 - Fix: `OTHER_OPTS="-o audio.period-size=1024"` in `~/.config/fluidsynth`; service restarted; quantum 1024; `ERR` flat.
+- Post-reboot residual: under game load the graph settled at 128 frames; the main PipeWire data-loop was `TS` and the sink gained about one xrun per second. The user manager's hard `RLIMIT_RTPRIO` was 0, so user-service limits were clamped.
+- Second fix: system-level `user@1000` `LimitRTPRIO=95` and `LimitNICE=40`, plus user PipeWire limits; the main data-loop became `FF 88`, and a 128-frame floor produced zero xruns over 15 seconds at about 430% CPU. A 512-frame floor was the interim no-RT workaround.
 - Wi-Fi power save and HDA runtime power saving were tested, showed no effect, and were reverted.

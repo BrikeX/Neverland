@@ -38,5 +38,18 @@ __pycache__/
 # cookie files
 *.cookie
 
+# local credentials (never commit)
+password
+passwd
+passphase
+passphrase
+password.*
+passwd.*
+passphase.*
+passphrase.*
+*.password
+*.passphrase
+*.secret
+
 # tool-specific directories
 .qoder/
