@@ -129,29 +129,33 @@ main=$(systemctl --user show pipewire -p MainPID --value)
 grep -i 'max realtime priority' /proc/$main/limits
 ```
 
-If the unit shows 95 but `/proc/.../limits` shows 0, the systemd user manager itself has a hard `RLIMIT_RTPRIO` of 0. An unprivileged user manager cannot raise that hard limit, so per-service drop-ins are clamped.
+If the unit shows 95 but `/proc/.../limits` shows 0, the systemd user manager itself is capped at 0. Per-service drop-ins are then clamped, and a system-level `user@1000.service` limit may also show as configured without reaching the running manager.
 
-Set the limit at the system level (replace 1000 with `id -u`):
+Use the distro's PipeWire RT group and PAM limits instead. Confirm the group and PAM config:
 
 ```bash
-sudo mkdir -p /etc/systemd/system/user@1000.service.d
-sudo tee /etc/systemd/system/user@1000.service.d/rt.conf >/dev/null <<'EOF'
-[Service]
-LimitRTPRIO=95
-LimitNICE=40
-EOF
-sudo systemctl daemon-reload
+getent group pipewire || sudo groupadd pipewire
+sudo usermod -aG pipewire "$USER"
+# If it exists, confirm it includes pam_limits; otherwise link the distro config:
+[ -e /etc/pam.d/systemd-user ] || sudo ln -s /usr/lib/pam.d/systemd-user /etc/pam.d/systemd-user
 ```
 
-Log out and back in so the user manager inherits the limit. To test without logging out, raise the live manager limit as root and restart the audio services:
+The distro limits file (`/etc/security/limits.d/25-pw-rlimits.conf`) then grants `@pipewire` RT 95, nice -19, and 4 GB memlock. Log out and back in so the group membership and PAM limits take effect. Verify:
+
+```bash
+sudo -u "$USER" -H bash -lc 'ulimit -r; ulimit -l'
+```
+
+Expect 95 and 4194304. To test without logging out, raise the live manager limit as root and restart the audio services:
 
 ```bash
 sudo prlimit --pid "$(pgrep -o -u "$USER" -x systemd)" --rtprio=95:95 --nice=40:40
-systemctl --user daemon-reload
 systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
 ```
 
-Keep per-service limits too; module-rt asks for RT 88 and nice -11:
+The `user@1000` drop-in is not a reliable substitute; trust `/proc/<pid>/limits` over `systemctl show`.
+
+Keep per-service limits if the manager defaults are lower; module-rt asks for RT 88 and nice -11:
 
 ```ini
 # ~/.config/systemd/user/pipewire.service.d/rt.conf
@@ -160,6 +164,8 @@ Keep per-service limits too; module-rt asks for RT 88 and nice -11:
 LimitRTPRIO=95
 LimitNICE=40
 ```
+
+After creating or changing these drop-ins, run `systemctl --user daemon-reload` before restarting the services.
 
 Verify the main service's data loop:
 
@@ -207,7 +213,8 @@ Tradeoffs:
 - Blaming the network driver. Disabling the radio is a stronger test than observing traffic correlation.
 - Blaming the Realtek codec when Bluetooth is also affected.
 - Adding realtime scheduling as a blind workaround. Fix measured underruns first, then verify the actual `/proc/<pid>/limits` and `ps -L` state.
-- Trusting `systemctl --user show ... LimitRTPRIO` when the user manager's hard limit is 0; check `/proc/<pid>/limits`.
+- Trusting `systemctl --user show ... LimitRTPRIO` or a system-level `user@` drop-in; check `/proc/<pid>/limits` and prefer the PipeWire group + PAM limits.
+- Missing `/etc/pam.d/systemd-user`, which prevents `pam_limits` from applying the `@pipewire` group limits to the user manager.
 - Setting `LimitRTPRIO` without `LimitNICE`; module-rt also requests nice -11 and may stay `TS`.
 - Leaving a 64/128-frame quantum without RT under load.
 
@@ -217,6 +224,6 @@ Tradeoffs:
 - Symptom: crackle during music, games, and video on speakers, wired headphones, and Bluetooth; unchanged with the Wi-Fi radio off.
 - Diagnosis: sink quantum 64 with `ERR` rising about 11 per second; the enabled user unit `fluidsynth.service` was requesting a 64-frame period.
 - Fix: `OTHER_OPTS="-o audio.period-size=1024"` in `~/.config/fluidsynth`; service restarted; quantum 1024; `ERR` flat.
-- Post-reboot residual: under game load the graph settled at 128 frames; the main PipeWire data-loop was `TS` and the sink gained about one xrun per second. The user manager's hard `RLIMIT_RTPRIO` was 0, so user-service limits were clamped.
-- Second fix: system-level `user@1000` `LimitRTPRIO=95` and `LimitNICE=40`, plus user PipeWire limits; the main data-loop became `FF 88`, and a 128-frame floor produced zero xruns over 15 seconds at about 430% CPU. A 512-frame floor was the interim no-RT workaround.
+- Post-reboot residual: under game load the graph settled at 128 frames; the main PipeWire data-loop was `TS` and the sink gained about one xrun per second. A `user@1000` drop-in showed `LimitRTPRIO=95` in `systemctl show` but the running user manager still had 0, so user-service limits were clamped.
+- Persistent fix: added the user to the `pipewire` group and linked `/etc/pam.d/systemd-user` to the distro PAM config so `pam_limits` applies `rtprio 95` and 4 GB memlock; the current session was raised with `prlimit`. Verified after reboot: manager 95/-19 and main data-loop `FF 88`. A 128-frame floor produced zero xruns over 15 seconds at about 430% CPU; a 512-frame floor was the interim no-RT workaround.
 - Wi-Fi power save and HDA runtime power saving were tested, showed no effect, and were reverted.
